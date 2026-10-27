@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MikroTik Traffic Log</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<svg class="icon-defs" aria-hidden="true"><defs>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7Z"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+</defs></svg>
+<header class="topbar">
+<span class="brand">MikroTik Traffic Log</span>
+<nav aria-label="Navigation">
+<button class="nav-item active" data-view="traffic">Traffic Log</button>
+<button class="nav-item" data-view="rules">Rules</button>
+<button class="nav-item" data-view="session">Router changes</button>
+</nav>
+<div class="top-right"><span id="sidebar-status"></span><button id="connection-button"><span id="router-label">Connect router</span></button><button id="shutdown-button">Quit</button></div>
+</header>
+<main>
+<div class="page-heading"><h1 id="page-title">Traffic Log</h1><div class="heading-actions"><span id="capture-status"></span><button class="primary" id="capture-button">Start capture</button></div></div>
+<div id="status-message" class="notice hidden" role="status"></div>
+
+<section id="view-traffic" class="view">
+<div class="summary-strip"><span><b id="metric-total">0</b> events</span><span><b id="metric-allow">0</b> allowed</span><span><b id="metric-deny">0</b> blocked / rejected</span><span><b id="metric-sources">0</b> sources</span></div>
+<div class="traffic-card">
+<div class="filterbar">
+<input id="search" aria-label="Search traffic" placeholder="Search">
+<label class="compact-select">Action <select id="action-filter"><option value="">All</option><option value="accept">Allowed</option><option value="drop">Blocked</option><option value="reject">Rejected</option></select></label>
+<label class="compact-select">Protocol <select id="protocol-filter"><option value="">All</option><option>TCP</option><option>UDP</option><option>ICMP</option><option>ICMPV6</option></select></label>
+<button id="add-filter">Add filter</button><button id="reset-filters">Reset</button>
+</div>
+<div class="filter-chips hidden" id="filter-chips"></div>
+<div class="table-toolbar"><span id="result-label">0 matches</span><div><button id="pause-button" aria-pressed="false"><span>Pause</span></button><button id="export-button">Export CSV</button><button id="clear-button" title="Clear events">Clear</button></div></div>
+<div class="table-scroll"><table class="traffic-table"><thead><tr>
+<th data-sort="received" class="sorted">Time <span>↓</span></th><th data-sort="source">Source <span>↕</span></th><th data-sort="destination">Destination <span>↕</span></th><th data-sort="destination_port">Dst. port <span>↕</span></th><th data-sort="protocol">Protocol <span>↕</span></th><th data-sort="action">Action <span>↕</span></th><th data-sort="rule_name">Rule <span>↕</span></th><th data-sort="input">Ingress <span>↕</span></th><th data-sort="output">Egress <span>↕</span></th><th data-sort="chain">Chain <span>↕</span></th><th data-sort="length">Length <span>↕</span></th>
+</tr></thead><tbody id="traffic-body"></tbody></table>
+<div class="empty-state" id="empty-state"><h2>No entries.</h2><div><button id="empty-connect">Connect router</button></div></div>
+</div>
+<div class="table-footer"><div class="pagination"><label>Rows <select id="page-size"><option>50</option><option selected>100</option><option>250</option></select></label><span id="page-label">0–0 of 0</span><button id="previous-page" aria-label="Previous page">‹</button><button id="next-page" aria-label="Next page">›</button></div></div>
+</div>
+</section>
+
+<section id="view-rules" class="view hidden">
+<div class="rule-toolbar"><input id="rule-search" placeholder="Search" aria-label="Search rules"><select id="rule-chain" aria-label="Rule chain"><option value="">All chains</option><option>forward</option><option>input</option><option>output</option></select><button id="select-default">All</button><button id="select-block">Blocked only</button><button id="select-none">None</button><span id="selection-count"></span><button id="refresh-rules">Reload</button></div>
+<div class="panel rules-table-scroll"><table class="rules-table"><thead><tr><th></th><th>#</th><th>Rule</th><th>Action</th><th>Chain</th><th>Source</th><th>Destination</th><th>Status</th></tr></thead><tbody id="rules-body"></tbody></table><div id="rules-empty" class="small-empty">No rules.</div></div>
+</section>
+
+<section id="view-session" class="view hidden">
+<div class="session-grid">
+<div class="panel"><h2>Capture</h2><dl id="session-details"><dt>Status</dt><dd>No capture</dd></dl></div>
+</div>
+<div id="session-change-details" class="hidden">
+<div class="panel script-panel"><div class="section-heading"><h2>Capture · RouterOS commands</h2><button data-copy="session-commands">Copy</button></div><textarea id="session-commands" class="script" readonly spellcheck="false" aria-label="Router setup commands" rows="9"></textarea></div>
+<div class="panel script-panel"><div class="section-heading"><h2>Rollback · RouterOS commands</h2><button data-copy="session-undo">Copy</button></div><textarea id="session-undo" class="script" readonly spellcheck="false" aria-label="Rollback commands" rows="5"></textarea></div>
+</div>
+<div class="panel"><div class="section-heading"><h2>Leftover captures</h2><button id="find-sessions">Search</button></div><div id="orphan-results"></div></div>
+</section>
+</main>
+
+<dialog id="connection-dialog"><form id="connection-form">
+<div class="dialog-heading"><h2>Connect router</h2><button type="button" class="close-button" data-close="connection-dialog" aria-label="Close">×</button></div>
+<label>Address<input id="router-address" name="address" required placeholder="http://Router-IP" autocomplete="url"></label>
+<div class="form-grid"><label>Username<input id="router-user" name="username" value="admin" required autocomplete="username"></label><label>Password<input id="router-password" name="password" type="password" required autocomplete="current-password"></label></div>
+<label class="check-label hidden" id="tls-option"><input type="checkbox" id="self-signed">Skip TLS certificate verification</label>
+<div id="connection-error" class="form-error hidden" role="alert"></div>
+<div class="dialog-footer"><button type="button" data-close="connection-dialog">Cancel</button><button type="submit" class="primary" id="connect-submit">Connect</button></div>
+</form></dialog>
+
+<dialog id="capture-dialog" class="wide-dialog"><form id="capture-form">
+<div class="dialog-heading"><h2>Start capture</h2><button type="button" class="close-button" data-close="capture-dialog" aria-label="Close">×</button></div>
+<div class="form-grid"><label>Mode<select id="capture-mode"><option value="new">New connections</option><option value="all">All rule hits</option></select></label><label>Time limit<select id="capture-minutes"><option value="5">5 minutes</option><option value="15" selected>15 minutes</option><option value="30">30 minutes</option><option value="60">60 minutes</option></select></label></div>
+<label>Source IP (optional)<input id="capture-source" inputmode="decimal"></label>
+<div class="section-heading"><span id="capture-selection">0 Rules</span><button type="button" id="edit-selection">Select rules</button></div>
+<p id="capture-plan-summary"></p>
+<div class="section-heading"><h3>Planned RouterOS commands</h3><button type="button" data-copy="capture-commands">Copy</button></div>
+<textarea class="script" id="capture-commands" aria-label="Planned router commands" readonly spellcheck="false" rows="9"></textarea>
+<div class="section-heading"><h3>Rollback</h3><button type="button" data-copy="capture-undo">Copy</button></div>
+<textarea class="script" id="capture-undo" aria-label="Planned rollback commands" readonly spellcheck="false" rows="5"></textarea>
+<div id="capture-error" class="form-error hidden" role="alert"></div>
+<div class="dialog-footer"><button type="button" data-close="capture-dialog">Cancel</button><button type="submit" class="primary" id="capture-submit">Start</button></div>
+</form></dialog>
+
+<dialog id="filter-dialog"><form id="filter-form">
+<div class="dialog-heading"><h2>Add filter</h2><button type="button" class="close-button" data-close="filter-dialog" aria-label="Close">×</button></div>
+<label>Field<select id="filter-field"><option value="source">Source IP</option><option value="destination">Destination IP</option><option value="destination_port">Dst. port</option><option value="source_port">Source port</option><option value="rule_name">Rule</option><option value="input">Ingress</option><option value="output">Egress</option><option value="chain">Chain</option></select></label>
+<label>Value<input id="filter-value" list="filter-values" required><datalist id="filter-values"></datalist></label><p class="help-text" id="filter-help"></p>
+<div id="filter-error" class="form-error hidden"></div>
+<div class="dialog-footer"><button type="button" data-close="filter-dialog">Cancel</button><button type="submit" class="primary">Apply</button></div>
+</form></dialog>
+<aside id="detail-drawer" class="detail-drawer hidden" aria-label="Event details"><div class="drawer-heading"><h2>Traffic details</h2><button id="close-details" class="close-button" aria-label="Close details">×</button></div><div id="detail-content"></div></aside>
+<div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>
