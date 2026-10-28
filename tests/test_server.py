@@ -74,19 +74,51 @@ class HTTPTests(unittest.TestCase):
         self.app.client.get.return_value={"date":"2026-10-27","time":"14:00:00"}
         self.app.router={"name":"Test", "address":"http://10.0.4.254"}
         self.app.rules=[{".id":"*A","action":"drop","chain":"input","comment":"Drop"}]
-        options={"rules":["*A"],"minutes":15,"new_only":True,"source_ip":""}
+        options={"rules":["*A"],"minutes":15,"new_only":True,"source_ip":"", "buffer_lines":20000,"event_limit":1000000,"memory_mib":512}
         with self.request("/api/capture/preview",options) as response:
             preview=json.load(response)
         self.app.client.add.assert_not_called()
         self.app.client.delete.assert_not_called()
         self.assertIn("/system scheduler add",preview["commands"])
         self.assertIn(preview["plan_id"],preview["undo"])
+        self.assertIn('memory-lines="20000"',preview["commands"])
         with patch.object(self.app,"orphans",return_value=[]),patch("trafficlog.capture.Capture.start"):
             with self.assertRaises(urllib.error.HTTPError):
                 self.request("/api/capture/start",dict(options,plan_id=preview["plan_id"],minutes=30))
+            for change in [{"buffer_lines":30000},{"event_limit":500000},{"memory_mib":1024}]:
+                with self.subTest(change=change),self.assertRaises(urllib.error.HTTPError):
+                    self.request("/api/capture/start",dict(options,plan_id=preview["plan_id"],**change))
             with self.request("/api/capture/start",dict(options,plan_id=preview["plan_id"])) as response:
                 self.assertTrue(json.load(response)["ok"])
         self.assertEqual(self.app.capture.session,preview["plan_id"])
+        self.assertEqual(self.app.events.event_limit,1000000)
+        self.assertEqual(self.app.events.memory_mib,512)
+
+    def test_storage_limits_are_validated_before_router_operations(self):
+        self.app.client=Mock()
+        self.app.router={"name":"Test"}
+        for key, values in {"buffer_lines":[0,65536,True,2000.5],"event_limit":[0,1000001,"10000"],"memory_mib":[15,2049,None]}.items():
+            for value in values:
+                with self.subTest(key=key,value=value),self.assertRaises(urllib.error.HTTPError) as caught:
+                    self.request("/api/capture/preview",{key:value})
+                self.assertEqual(caught.exception.code,400)
+        self.app.client.get.assert_not_called()
+        self.app.client.add.assert_not_called()
+
+    def test_large_history_uses_bounded_batches_without_skipping_events(self):
+        for i in range(15001):
+            self.app.emit({"source":"192.0.2.1"})
+        cursor,received=0,[]
+        while True:
+            with self.request(f"/api/state?since={cursor}") as response:
+                result=json.load(response)
+            self.assertLessEqual(len(result["events"]),2000)
+            received.extend(event["sequence"] for event in result["events"])
+            cursor=result["sequence"]
+            if not result["has_more"]:break
+        self.assertEqual(received,list(range(1,15002)))
+        self.assertEqual(result["storage"]["event_limit"],100000)
+        self.assertEqual(result["retained_from"],1)
 
 
 if __name__ == "__main__":

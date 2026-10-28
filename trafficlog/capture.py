@@ -8,6 +8,7 @@ import threading
 import time
 
 from .router import RouterError
+from .storage import DEFAULT_BUFFER_LINES, MAX_BUFFER_LINES, bounded_integer
 
 MARKER = "TrafficLog:"
 MARKERS = (MARKER, "TrafficLens:")
@@ -198,12 +199,13 @@ def cleanup_session(client, session):
 
 
 class Capture:
-    def __init__(self, client, router, rules, selected, minutes=15, new_only=True, source_ip=""):
+    def __init__(self, client, router, rules, selected, minutes=15, new_only=True, source_ip="", buffer_lines=DEFAULT_BUFFER_LINES):
         self.client, self.router = client, router
         self.session = secrets.token_hex(5)
         self.buffer = "tl" + self.session
         self.deadline_name = "tlstop" + self.session
         self.minutes = max(1, min(60, int(minutes)))
+        self.buffer_lines = bounded_integer(buffer_lines, "Router buffer", 1, MAX_BUFFER_LINES)
         self.new_only, self.source_ip = bool(new_only), source_ip.strip()
         if self.source_ip:
             ipaddress.IPv4Address(self.source_ip)
@@ -242,6 +244,7 @@ class Capture:
                 "probes": self.created_count, "planned": len(self.plan),
                 "skipped": self.skipped, "parse_errors": self.parse_errors,
                 "buffer_pressure": self.buffer_pressure,
+                "buffer_lines": self.buffer_lines,
                 "commands": self.commands(), "undo": "\n".join(cleanup_commands(self.session))}
 
     def deadline_payload(self, clock):
@@ -265,7 +268,7 @@ class Capture:
         if self.deadline_body:
             resources.append(("system/scheduler", self.deadline_body))
         resources.extend([
-            ("system/logging/action", {"name": self.buffer, "target": "memory", "memory-lines": "2000", "memory-stop-on-full": "no"}),
+            ("system/logging/action", {"name": self.buffer, "target": "memory", "memory-lines": str(self.buffer_lines), "memory-stop-on-full": "no"}),
             ("system/logging", {"action": self.buffer, "topics": "firewall", "regex": "^TL" + self.session + "_"}),
         ])
         resources.extend(("ip/firewall/filter", body) for _, body, _, _ in self.plan)
@@ -281,7 +284,7 @@ class Capture:
     def prepare(self):
         self.install_deadline()
         self.client.add("system/logging/action", {
-            "name": self.buffer, "target": "memory", "memory-lines": "2000",
+            "name": self.buffer, "target": "memory", "memory-lines": str(self.buffer_lines),
             "memory-stop-on-full": "no",
         })
         self.client.add("system/logging", {
@@ -330,8 +333,8 @@ class Capture:
                     failures = 0
                     self.message = "Capture running"
                     fresh = [r for r in rows if r.get(".id") not in self.seen]
-                    if len(rows) >= 1950 and len(fresh) > 1000:
-                        self.buffer_pressure = True
+                    self.buffer_pressure = (len(rows) >= self.buffer_lines * 0.975
+                                            and len(fresh) > self.buffer_lines * 0.5)
                     for row in fresh:
                         self.seen.add(row.get(".id"))
                         event = parse_log(row, self.probes, self.router)

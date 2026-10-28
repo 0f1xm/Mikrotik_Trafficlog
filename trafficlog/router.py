@@ -8,6 +8,7 @@ import threading
 import urllib.parse
 
 MAX_RESPONSE_SIZE = 4 * 1024 * 1024
+MAX_LOG_RESPONSE_SIZE = 64 * 1024 * 1024
 
 
 class RouterError(Exception):
@@ -68,8 +69,9 @@ class RouterClient:
             "User-Agent": "MikrotikTrafficlog/0.3",
         })
         with self._connection.getresponse() as response:
-            raw = response.read(MAX_RESPONSE_SIZE + 1)
-            if len(raw) > MAX_RESPONSE_SIZE:
+            limit = MAX_LOG_RESPONSE_SIZE if method == "POST" and path == "/rest/log/print" else MAX_RESPONSE_SIZE
+            raw = response.read(limit + 1)
+            if len(raw) > limit:
                 self._close_connection()
                 raise RouterError("Router response is too large.")
             status, reason = response.status, response.reason

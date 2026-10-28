@@ -80,6 +80,8 @@
 <div class="dialog-heading"><h2>Start capture</h2><button type="button" class="close-button" data-close="capture-dialog" aria-label="Close">×</button></div>
 <div class="form-grid"><label>Mode<select id="capture-mode"><option value="new">New connections</option><option value="all">All rule hits</option></select></label><label>Time limit<select id="capture-minutes"><option value="5">5 minutes</option><option value="15" selected>15 minutes</option><option value="30">30 minutes</option><option value="60">60 minutes</option></select></label></div>
 <label>Source IP (optional)<input id="capture-source" inputmode="decimal"></label>
+<div class="form-grid"><label>Router buffer · max 65,535<input id="capture-buffer" type="number" min="1" max="65535" step="1" value="20000" required></label><label>Local events · max 1,000,000<input id="capture-events" type="number" min="1" max="1000000" step="1" value="100000" required></label></div>
+<label>Event memory budget (MiB) · max 2,048<input id="capture-memory" type="number" min="16" max="2048" step="1" value="256" required></label>
 <div class="section-heading"><span id="capture-selection">0 Rules</span><button type="button" id="edit-selection">Select rules</button></div>
 <p id="capture-plan-summary"></p>
 <div class="section-heading"><h3>Planned RouterOS commands</h3><button type="button" data-copy="capture-commands">Copy</button></div>

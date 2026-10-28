@@ -1,11 +1,14 @@
 import {actions,fields,ipNumber,compileFilter,normalizeFilterValue,formatFilterValue,formatFilterOperator,parseFilterInput} from "./filters.mjs";
+import {mergeEvents,trimEvents} from "./events.mjs";
 
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const icon = name => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
 const services = {20:"FTP",21:"FTP",22:"SSH",25:"SMTP",53:"DNS",67:"DHCP",68:"DHCP",80:"HTTP",123:"NTP",161:"SNMP",179:"BGP",443:"HTTPS",445:"SMB",3389:"RDP",8000:"HTTP",8291:"WinBox"};
 const state = {token:"",router:null,rules:[],knownRules:new Set(),selected:new Set(),events:[],sequence:0,session:null,view:"traffic",filters:[],search:"",sort:"received",descending:true,page:0,pageSize:100,paused:false,pausedEvents:null,detail:null,closed:false,lastRuleSignature:""};
-let toastTimer, pollBusy = false, previewVersion = 0, previewPlan = null;
+let toastTimer, pollTimer, previewTimer, pollBusy = false, previewVersion = 0, previewPlan = null, eventVersion=0;
+let filteredCache=null, metricsCache=null;
+let lastTrafficRender=0;
 let suggestions=[], activeSuggestion=-1, editingFilter=null;
 
 function toast(message) {
@@ -28,6 +31,7 @@ function closeDialog(id) { $(id).close(); }
 function errorBox(id, message) { $(id).textContent = message; $(id).classList.toggle("hidden", !message); }
 function setPaused(paused) {
   state.paused=paused; state.pausedEvents=paused?[...state.events]:null;
+  state.pausedAt=state.sequence;
   $("pause-button").classList.toggle("paused",paused);
   $("pause-button").setAttribute("aria-pressed",String(paused));
   $("pause-button").querySelector("span").textContent=paused?"Resume":"Pause";
@@ -47,6 +51,7 @@ function consume(data) {
   const oldKey = (state.router?.address || "");
   if (key !== oldKey) {
     state.selected.clear(); state.knownRules.clear(); state.events = []; state.detail = null;
+    eventVersion++;
     $("detail-drawer").classList.add("hidden");
     if(oldKey){state.filters=[];state.search="";$("search").value="";editingFilter=null;closeSuggestions();}
     state.page=0;setPaused(false);
@@ -59,15 +64,17 @@ function consume(data) {
   }
   const ids = new Set(state.rules.map(r => r.id));
   state.selected.forEach(id => { if (!ids.has(id)) state.selected.delete(id); });
-  if (data.events?.length) {
-    const seen = new Set(state.events.map(e => e.sequence));
-    state.events.push(...data.events.filter(e => !seen.has(e.sequence)));
-    if (state.events.length > 10000) state.events.splice(0, state.events.length - 10000);
-  }
+  state.storage=data.storage || state.storage;
+  const oldest=data.retained_from ?? 0,limit=state.storage?.event_limit || 100000;
+  let changed=mergeEvents(state.events,data.events || [],state.sequence,oldest,limit);
+  if(state.pausedEvents)changed=trimEvents(state.pausedEvents,oldest,limit)||changed;
+  if(changed)eventVersion++;
   state.sequence = data.sequence;
   renderStatus();
-  if (!state.paused) renderTraffic();
-  else $("pause-button").querySelector("span").textContent = `Resume (${Math.max(0,state.events.length - state.pausedEvents.length)} new)`;
+  if(!data.has_more||Date.now()-lastTrafficRender>=500){
+    if (!state.paused || changed) renderTraffic();
+  }
+  if(state.paused)$("pause-button").querySelector("span").textContent = `Resume (${Math.max(0,state.sequence - state.pausedAt)} new)`;
   const signature = JSON.stringify(state.rules);
   if (state.view === "rules" && signature !== state.lastRuleSignature) renderRules();
   state.lastRuleSignature = signature;
@@ -76,15 +83,18 @@ function consume(data) {
 
 async function poll() {
   if (pollBusy || state.closed) return;
+  clearTimeout(pollTimer);
   pollBusy = true;
+  let delay=1000;
   try {
     const response = await fetch(`/api/state?since=${state.sequence}`, {cache:"no-store"});
     if (!response.ok) throw new Error("Local connection failed");
-    consume(await response.json());
+    const data=await response.json();consume(data);
+    if(data.has_more)delay=50;
     $("sidebar-status").textContent = state.router ? state.router.address : "";
   } catch (err) {
     $("sidebar-status").textContent = "Application unavailable";
-  } finally { pollBusy = false; }
+  } finally { pollBusy = false;if(!state.closed)pollTimer=setTimeout(poll,delay); }
 }
 
 function renderStatus() {
@@ -107,7 +117,8 @@ function renderStatus() {
   if (session?.phase === "starting" || session?.phase === "stopping") messages.push(session.message);
   if (session?.error) messages.push(session.error);
   if (session?.cleanup_errors?.length) messages.push("Cleanup incomplete. Retry in Router changes; the expiry task is still in place.");
-  if (session?.buffer_pressure) messages.push("High log rate: events may be lost. Narrow capture to a source IP.");
+  if (live && session?.buffer_pressure) messages.push("High log rate: router buffer may overrun. Increase the buffer or narrow capture.");
+  if(state.storage?.evicted)messages.push(`${state.storage.evicted.toLocaleString("en-GB")} oldest events removed at the local storage limit.`);
   if (session?.parse_errors) messages.push(`${session.parse_errors} messages could not be parsed.`);
   if (session?.skipped?.length) messages.push(`${session.skipped.length} rules skipped. See Router changes.`);
   $("status-message").textContent = messages.join(" ");
@@ -119,16 +130,20 @@ function renderStatus() {
 }
 
 function filteredEvents() {
+  const key=JSON.stringify([eventVersion,state.paused,state.filters,state.search,state.sort,state.descending]);
+  if(filteredCache?.key===key)return filteredCache.rows;
   const events=state.paused?state.pausedEvents:state.events;
   const predicates=state.filters.map(f=>compileFilter(f.field,f.value,f.negated));
   if(state.search.trim())predicates.push(compileFilter("text",state.search));
   const result=events.filter(e=>predicates.every(test=>test(e)));
-  result.sort((a,b) => {
+  if(state.sort==="received"){if(state.descending)result.reverse();}
+  else result.sort((a,b) => {
     let av=a[state.sort] ?? "",bv=b[state.sort] ?? "", comparison;
     if (["source","destination"].includes(state.sort)) {try {av=ipNumber(av);bv=ipNumber(bv);} catch {}}
     comparison = typeof av==="number" && typeof bv==="number" ? av-bv : String(av).localeCompare(String(bv),"en",{numeric:true});
     return (state.descending ? -1 : 1) * comparison;
   });
+  filteredCache={key,rows:result};
   return result;
 }
 
@@ -142,12 +157,18 @@ function displayTime(event) {
 }
 
 function renderTraffic() {
+  lastTrafficRender=Date.now();
   const all = state.paused ? state.pausedEvents : state.events;
-  const allowed = all.filter(e => e.action==="accept").length;
+  const metricKey=eventVersion+":"+state.paused;
+  if(metricsCache?.key!==metricKey){
+    let allowed=0,denied=0;const sources=new Set();
+    for(const event of all){allowed+=event.action==="accept";denied+=["drop","reject"].includes(event.action);sources.add(event.source);}
+    metricsCache={key:metricKey,allowed,denied,sources:sources.size};
+  }
   $("metric-total").textContent = all.length.toLocaleString("en-GB");
-  $("metric-allow").textContent = allowed.toLocaleString("en-GB");
-  $("metric-deny").textContent = all.filter(e => ["drop","reject"].includes(e.action)).length.toLocaleString("en-GB");
-  $("metric-sources").textContent = new Set(all.map(e => e.source)).size;
+  $("metric-allow").textContent = metricsCache.allowed.toLocaleString("en-GB");
+  $("metric-deny").textContent = metricsCache.denied.toLocaleString("en-GB");
+  $("metric-sources").textContent = metricsCache.sources;
   const rows = filteredEvents();
   state.page = Math.min(state.page, Math.max(0, Math.ceil(rows.length/state.pageSize)-1));
   const start = state.page*state.pageSize, page = rows.slice(start,start+state.pageSize);
@@ -235,11 +256,16 @@ function closeSuggestions(){
 function filterSuggestions(){
   const input=$("search").value,parsed=parseFilterInput(input);
   if(parsed){
-    let values=parsed.field==="action"?Object.keys(actions):parsed.field==="protocol"?["TCP","UDP","ICMP","ICMPV6"]:[];
-    values=[...new Set([...values,...state.events.map(e=>e[parsed.field]).filter(v=>v!==null&&v!==undefined&&v!=="").map(String)])];
+    const values=[],seen=new Set();
     const term=parsed.value.toLowerCase();
-    return values.filter(v=>v.toLowerCase().includes(term)||formatFilterValue(parsed.field,v).toLowerCase().includes(term))
-      .slice(0,12).map(value=>({type:"value",field:parsed.field,value,negated:!!parsed.negated,label:formatFilterValue(parsed.field,value)}));
+    const add=value=>{
+      if(value===null||value===undefined||value==="")return;
+      const v=String(value);if(seen.has(v))return;
+      if(v.toLowerCase().includes(term)||formatFilterValue(parsed.field,v).toLowerCase().includes(term)){seen.add(v);values.push(v);}
+    };
+    for(const value of parsed.field==="action"?Object.keys(actions):parsed.field==="protocol"?["TCP","UDP","ICMP","ICMPV6"]:[])add(value);
+    for(const event of state.events){if(values.length>=12)break;add(event[parsed.field]);}
+    return values.slice(0,12).map(value=>({type:"value",field:parsed.field,value,negated:!!parsed.negated,label:formatFilterValue(parsed.field,value)}));
   }
   const term=input.trim().toLowerCase();
   const rows=Object.entries(fields).filter(([field,label])=>field!=="text"&&(!term||label.toLowerCase().includes(term)||field.includes(term)))
@@ -332,10 +358,11 @@ async function copyScript(id) {
 }
 
 function captureOptions() {
-  return {rules:[...state.selected],minutes:Number($("capture-minutes").value),new_only:$("capture-mode").value==="new",source_ip:$("capture-source").value.trim()};
+  return {rules:[...state.selected],minutes:Number($("capture-minutes").value),new_only:$("capture-mode").value==="new",source_ip:$("capture-source").value.trim(),buffer_lines:Number($("capture-buffer").value),event_limit:Number($("capture-events").value),memory_mib:Number($("capture-memory").value)};
 }
 
 async function refreshPreview() {
+  clearTimeout(previewTimer);
   const version=++previewVersion;
   previewPlan=null;$("capture-submit").disabled=true;
   setScript("capture-commands","");setScript("capture-undo","");
@@ -394,10 +421,17 @@ $("capture-form").onsubmit=async e=>{
     if(!previewPlan)return;
     $("capture-submit").disabled=true;
     await api("/api/capture/start",{...captureOptions(),plan_id:previewPlan.plan_id});
-    state.events=[];setPaused(false);closeDialog("capture-dialog");showView("traffic");await poll();
+    const {buffer_lines,event_limit,memory_mib}=captureOptions();
+    state.storage={event_limit,memory_mib,estimated_bytes:0,evicted:0};
+    try{localStorage.setItem("mikrotik-trafficlog-limits",JSON.stringify({buffer_lines,event_limit,memory_mib}));}catch{}
+    state.events=[];eventVersion++;setPaused(false);closeDialog("capture-dialog");showView("traffic");await poll();
   }catch(err){errorBox("capture-error",err.message);}finally{$("capture-submit").disabled=false;}
 };
-for(const id of ["capture-mode","capture-minutes","capture-source"])$(id).onchange=refreshPreview;
+for(const id of ["capture-mode","capture-minutes","capture-source","capture-buffer","capture-events","capture-memory"])$(id).onchange=refreshPreview;
+for(const id of ["capture-source","capture-buffer","capture-events","capture-memory"])$(id).oninput=()=>{
+  clearTimeout(previewTimer);previewVersion++;previewPlan=null;$("capture-submit").disabled=true;
+  previewTimer=setTimeout(refreshPreview,250);
+};
 $("edit-selection").onclick=()=>{closeDialog("capture-dialog");showView("rules");};
 $("empty-connect").onclick=()=>state.events.length ? resetFilters() : state.router ? openCapture() : openConnection();
 $("filter-form").onsubmit=e=>{e.preventDefault();commitFilterInput();};
@@ -441,7 +475,7 @@ document.addEventListener("pointerdown",e=>{if(!$("filter-form").contains(e.targ
 $("pause-button").onclick=()=>{
   setPaused(!state.paused);renderTraffic();
 };
-$("clear-button").onclick=async()=>{try{await api("/api/events/clear");state.events=[];if(state.paused)state.pausedEvents=[];state.page=0;renderTraffic();}catch(e){toast(e.message);}};
+$("clear-button").onclick=async()=>{try{await api("/api/events/clear");state.events=[];eventVersion++;if(state.paused)state.pausedEvents=[];state.page=0;renderTraffic();}catch(e){toast(e.message);}};
 $("export-button").onclick=exportCSV;
 $("page-size").onchange=e=>{state.pageSize=Number(e.target.value);state.page=0;renderTraffic();};
 $("previous-page").onclick=()=>{state.page--;renderTraffic();};$("next-page").onclick=()=>{state.page++;renderTraffic();};
@@ -477,7 +511,14 @@ document.addEventListener("keydown",e=>{if(e.key==="/"&&!document.querySelector(
 
 async function init(){
   try{const remembered=JSON.parse(localStorage.getItem("mikrotik-trafficlog-connection")||"null");if(remembered?.username)$("router-user").value=remembered.username;}catch{}
-  try{const bootstrap=await(await fetch("/api/bootstrap")).json();state.token=bootstrap.token;$("router-address").value=bootstrap.address || "";updateTLSOption();await poll();setInterval(poll,1000);}catch{toast("Application unavailable.");}
+  try{
+    const limits=JSON.parse(localStorage.getItem("mikrotik-trafficlog-limits")||"null");
+    for(const [key,id] of [["buffer_lines","capture-buffer"],["event_limit","capture-events"],["memory_mib","capture-memory"]]){
+      const input=$(id),value=limits?.[key];
+      if(Number.isInteger(value)&&value>=Number(input.min)&&value<=Number(input.max))input.value=value;
+    }
+  }catch{}
+  try{const bootstrap=await(await fetch("/api/bootstrap")).json();state.token=bootstrap.token;$("router-address").value=bootstrap.address || "";updateTLSOption();await poll();}catch{toast("Application unavailable.");}
   renderTraffic();renderStatus();
 }
 init();

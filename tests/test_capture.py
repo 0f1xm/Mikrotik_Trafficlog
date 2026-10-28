@@ -2,6 +2,7 @@ import copy
 import json
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from trafficlog.capture import Capture, MARKER, add_command, cleanup_commands, cleanup_session, make_probe, parse_log
@@ -53,6 +54,38 @@ class FakeRouter:
 
 
 class CaptureTests(unittest.TestCase):
+    def test_custom_router_buffer_matches_preview_and_setup(self):
+        router = FakeRouter([policy()])
+        cap = Capture(router, "SG7", router.original, ["*AB"], buffer_lines=65_535)
+        self.assertIn('memory-lines="65535"', cap.commands())
+        cap.prepare()
+        self.assertEqual(router.tables["system/logging/action"][0]["memory-lines"], "65535")
+        for value in [0, 65_536, 20_000.5, True, "20000"]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Capture(router, "SG7", router.original, ["*AB"], buffer_lines=value)
+
+    def test_buffer_pressure_tracks_capacity_and_clears_after_rate_drops(self):
+        router = FakeRouter([policy()])
+        cap = Capture(router, "SG7", router.original, ["*AB"], buffer_lines=20_000)
+        observations = []
+        polls = [0]
+        def logs(buffer):
+            polls[0] += 1
+            if polls[0] == 1:
+                return [{".id": str(i)} for i in range(2000)]
+            if polls[0] == 2:
+                return [{".id": str(i)} for i in range(20_000)]
+            return [{".id": str(i)} for i in range(1, 20_001)]
+        def wait(seconds):
+            observations.append(cap.buffer_pressure)
+            if len(observations) == 3:
+                cap.stop()
+        router.logs = logs
+        with patch.object(cap.stop_event, "wait", side_effect=wait):
+            cap.run(lambda event: None)
+        self.assertEqual(observations, [False, True, False])
+        self.assertEqual(cap.phase, "stopped")
+
     def test_probe_preserves_policy_and_cannot_accept_or_drop(self):
         original = policy(**{"dst-address-list": "internal", "reject-with": "tcp-reset"})
         before = copy.deepcopy(original)

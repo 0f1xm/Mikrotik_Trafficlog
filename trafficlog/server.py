@@ -5,13 +5,14 @@ import secrets
 import threading
 import time
 import urllib.parse
-from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .capture import Capture, MARKERS, SESSION_RE, cleanup_commands, cleanup_session, discover_owned, owned_session, public_rule, records
 from .network import connection_defaults
 from .router import RouterClient, RouterError
+from .storage import (EventStore, bounded_integer, DEFAULT_BUFFER_LINES, MAX_BUFFER_LINES,
+                      DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT, DEFAULT_MEMORY_MIB, MAX_MEMORY_MIB)
 
 WEB = Path(__file__).resolve().parent / "web"
 ACTIVE = {"starting", "running", "stopping"}
@@ -27,7 +28,7 @@ class Application:
         self.capture = None
         self.pending_capture = None
         self.pending_options = None
-        self.events = deque(maxlen=10000)
+        self.events = EventStore()
         self.sequence = 0
         self.token = secrets.token_urlsafe(32)
         self.notice = ""
@@ -103,19 +104,27 @@ class Application:
                 capture = self.make_capture(payload)
             self.pending_capture = self.pending_options = None
             self.capture = capture
-            self.events.clear()
+            options = self.capture_options(payload)
+            self.events = EventStore(options["event_limit"], options["memory_mib"])
             capture.start(self.emit)
         return {"ok": True}
 
     @staticmethod
     def capture_options(payload):
-        return {key: payload.get(key, default) for key, default in
-                [("rules", []), ("minutes", 15), ("new_only", True), ("source_ip", "")]}
+        options = {key: payload.get(key, default) for key, default in
+                   [("rules", []), ("minutes", 15), ("new_only", True), ("source_ip", ""),
+                    ("buffer_lines", DEFAULT_BUFFER_LINES), ("event_limit", DEFAULT_EVENT_LIMIT),
+                    ("memory_mib", DEFAULT_MEMORY_MIB)]}
+        for key, label, minimum, maximum in [("buffer_lines", "Router buffer", 1, MAX_BUFFER_LINES),
+                                             ("event_limit", "Local event limit", 1, MAX_EVENT_LIMIT),
+                                             ("memory_mib", "Event memory", 16, MAX_MEMORY_MIB)]:
+            bounded_integer(options[key], label, minimum, maximum)
+        return options
 
     def make_capture(self, payload):
         options = self.capture_options(payload)
         return Capture(self.client, self.router["name"], self.rules,
-                       options["rules"], options["minutes"], options["new_only"], options["source_ip"])
+                       options["rules"], options["minutes"], options["new_only"], options["source_ip"], options["buffer_lines"])
 
     def preview(self, payload):
         if self.active():
@@ -188,12 +197,15 @@ class Application:
             if heartbeat and self.capture:
                 self.capture.last_heartbeat = time.monotonic()
             session = self.capture.snapshot() if self.capture else None
+            events = self.events.batch(since, self.sequence)
+            cursor = events[-1]["sequence"] if events else self.sequence
             return {"router": self.router,
                     "rules": [public_rule(r, i) for i, r in enumerate(self.rules)
                               if not r.get("comment", "").startswith(MARKERS)],
                     "session": session,
-                    "events": [e for e in self.events if e["sequence"] > since],
-                    "sequence": self.sequence, "retained": len(self.events),
+                    "events": events, "sequence": cursor, "has_more": cursor < self.sequence,
+                    "retained_from": self.events.oldest(self.sequence + 1),
+                    "retained": len(self.events), "storage": self.events.snapshot(),
                     "notice": self.notice}
 
     def close(self):
@@ -257,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self.reply(400, {"error": "Invalid cursor"})
             return self.reply(200, app.state(since))
-        if path in {"/", "/index.html", "/app.js", "/filters.mjs", "/styles.css"}:
+        if path in {"/", "/index.html", "/app.js", "/filters.mjs", "/events.mjs", "/styles.css"}:
             file = WEB / ("index.html" if path == "/" else path[1:])
             mime = {".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css"}[file.suffix]
             return self.reply(200, file.read_bytes(), mime + "; charset=utf-8")

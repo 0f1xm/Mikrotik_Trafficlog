@@ -46,6 +46,12 @@ class KeepAliveServer(ThreadingHTTPServer):
 class KeepAliveHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def handle(self):
+        try:
+            super().handle()
+        except ConnectionResetError:
+            pass
+
     def log_message(self, *args):
         pass
 
@@ -103,7 +109,7 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.record()
-        self.reply([])
+        self.reply(getattr(self.server,"log_rows",[]))
 
     def do_DELETE(self):
         self.record()
@@ -134,6 +140,15 @@ class ConnectionTests(RouterTestCase):
     def setUp(self):
         self.server = self.start_server()
         self.router = self.client(self.server)
+
+    def test_large_log_buffers_use_a_separate_bounded_response_limit(self):
+        self.server.log_rows=[{".id":str(i),"message":"x"*250} for i in range(20000)]
+        self.assertGreater(len(json.dumps(self.server.log_rows)),4*1024*1024)
+        self.assertEqual(len(self.router.logs("tlabcdef1234")),20000)
+        with patch("trafficlog.router.MAX_LOG_RESPONSE_SIZE",1024):
+            with self.assertRaisesRegex(RouterError,"too large"):
+                self.router.logs("tlabcdef1234")
+        self.assertIsNone(self.router._connection)
 
     def test_rules_reads_logs_and_delete_reuse_one_connection(self):
         for index in range(20):
