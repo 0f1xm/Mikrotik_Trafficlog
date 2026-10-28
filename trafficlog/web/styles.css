@@ -32,6 +32,8 @@ dialog{padding:18px;width:480px;max-width:calc(100vw - 24px);max-height:calc(100
 .filter-input .filter-chips{display:contents}
 .filter-chip{display:inline-flex;align-items:center;border:1px solid #d5dbe0;border-radius:2px;background:#edf0f2;font-size:12px;white-space:nowrap}
 .filter-chip.editing{border-color:#778b9e}
+.filter-chip.negated{border-color:#d0b893;background:#fff5e6}
+.filter-chip .filter-operator{font-weight:600;padding:4px 5px;border-left:1px solid #d5dbe0;border-right:1px solid #d5dbe0;border-radius:0}
 .filter-chip button{border:0;background:none;padding:4px 6px;font:inherit}
 .filter-chip button:hover{background:#e0e6ea}
 .filter-chip strong{font-weight:500}

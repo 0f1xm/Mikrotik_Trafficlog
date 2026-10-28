@@ -5,10 +5,13 @@ const aliases={src:"source",src_ip:"source",source:"source",dst:"destination",ds
 for(const [key,label] of Object.entries(fields)){aliases[key]=key;aliases[label.toLowerCase()]=key;}
 
 export function parseFilterInput(input){
-  const match=input.match(/^([^:]+):\s*([\s\S]*)$/);
+  const match=input.trim().match(/^(!\s*|NOT\s+)?([^:!=≠]+?)(?:\s*(:|!=|≠|=)\s*|\s+(not\s+in|in)(?:\s+|$))([\s\S]*)$/i);
   if(!match)return null;
-  const field=aliases[match[1].trim().toLowerCase()];
-  return field?{field,value:match[2].trim()}:null;
+  const field=aliases[match[2].trim().toLowerCase()];
+  if(!field)return null;
+  const result={field,value:match[5].trim()};
+  if(match[1]||match[3]==="!="||match[3]==="≠"||/^not\s+in$/i.test(match[4]||""))result.negated=true;
+  return result;
 }
 
 export function normalizeFilterValue(field,value){
@@ -30,6 +33,11 @@ export function formatFilterValue(field,value){
   return field==="action"?value.split(",").map(v=>actions[v]||v).join(", "):value;
 }
 
+export function formatFilterOperator(field,value,negated=false){
+  const membership=field!=="text"&&(value.includes(",")||(["source","destination"].includes(field)&&value.includes("/"))||(field.endsWith("_port")&&value.includes("-")));
+  return membership?(negated?"not in":"in"):(negated?"≠":"=");
+}
+
 export function ipNumber(ip){
   const parts=ip.split(".");
   if(parts.length!==4||parts.some(p=>!/^\d{1,3}$/.test(p)||Number(p)>255))throw new Error("Enter a valid IPv4 address or CIDR network.");
@@ -40,7 +48,12 @@ export function eventSearchText(event){
   return [event.source,event.destination,event.source_port,event.destination_port,event.rule_name,event.rule_id,event.protocol,event.input,event.output,event.chain,event.state,event.source_mac,actions[event.action],event.action].join(" ").toLowerCase();
 }
 
-export function compileFilter(field,value){
+export function compileFilter(field,value,negated=false){
+  const match=compilePositiveFilter(field,value);
+  return negated?event=>!match(event):match;
+}
+
+function compilePositiveFilter(field,value){
   value=normalizeFilterValue(field,value);
   if(field==="text")return e=>eventSearchText(e).includes(value.toLowerCase());
   const values=value.split(",").map(v=>v.trim()).filter(Boolean);

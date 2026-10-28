@@ -1,4 +1,4 @@
-import {actions,fields,ipNumber,compileFilter,normalizeFilterValue,formatFilterValue,parseFilterInput} from "./filters.mjs";
+import {actions,fields,ipNumber,compileFilter,normalizeFilterValue,formatFilterValue,formatFilterOperator,parseFilterInput} from "./filters.mjs";
 
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -120,7 +120,7 @@ function renderStatus() {
 
 function filteredEvents() {
   const events=state.paused?state.pausedEvents:state.events;
-  const predicates=state.filters.map(f=>compileFilter(f.field,f.value));
+  const predicates=state.filters.map(f=>compileFilter(f.field,f.value,f.negated));
   if(state.search.trim())predicates.push(compileFilter("text",state.search));
   const result=events.filter(e=>predicates.every(test=>test(e)));
   result.sort((a,b) => {
@@ -179,11 +179,11 @@ function renderTraffic() {
   });
 }
 
-function addFilter(field,value,index=null) {
-  value=normalizeFilterValue(field,value);compileFilter(field,value);
-  const filter={field,value};
+function addFilter(field,value,index=null,negated=false) {
+  value=normalizeFilterValue(field,value);compileFilter(field,value,negated);
+  const filter={field,value,negated:!!negated};
   if(index!==null)state.filters.splice(index,1);
-  if(!state.filters.some(f=>f.field===field&&f.value===value))state.filters.push(filter);
+  if(!state.filters.some(f=>f.field===field&&f.value===value&&!!f.negated===filter.negated))state.filters.push(filter);
   state.page=0;renderTraffic();
 }
 
@@ -221,7 +221,8 @@ function openDetails(event) {
 }
 
 function renderFilterChip(filter,index){
-  return '<span class="filter-chip'+(editingFilter===index?' editing':'')+'"><button type="button" data-edit-filter="'+index+'">'+esc(fields[filter.field])+': <strong>'+esc(formatFilterValue(filter.field,filter.value))+'</strong></button><button type="button" data-remove-filter="'+index+'" aria-label="Remove '+esc(fields[filter.field])+' filter">'+icon("x")+'</button></span>';
+  const label=esc(fields[filter.field]);
+  return '<span class="filter-chip'+(editingFilter===index?' editing':'')+(filter.negated?' negated':'')+'"><button type="button" data-edit-filter="'+index+'" aria-label="Edit '+label+' filter">'+label+'</button><button type="button" class="filter-operator" data-negate-filter="'+index+'" aria-label="Negate '+label+' filter" aria-pressed="'+!!filter.negated+'" title="Negate filter">'+formatFilterOperator(filter.field,filter.value,filter.negated)+'</button><button type="button" data-edit-filter="'+index+'" aria-label="Edit '+label+' value"><strong>'+esc(formatFilterValue(filter.field,filter.value))+'</strong></button><button type="button" data-remove-filter="'+index+'" aria-label="Remove '+label+' filter">'+icon("x")+'</button></span>';
 }
 
 function closeSuggestions(){
@@ -238,7 +239,7 @@ function filterSuggestions(){
     values=[...new Set([...values,...state.events.map(e=>e[parsed.field]).filter(v=>v!==null&&v!==undefined&&v!=="").map(String)])];
     const term=parsed.value.toLowerCase();
     return values.filter(v=>v.toLowerCase().includes(term)||formatFilterValue(parsed.field,v).toLowerCase().includes(term))
-      .slice(0,12).map(value=>({type:"value",field:parsed.field,value,label:formatFilterValue(parsed.field,value)}));
+      .slice(0,12).map(value=>({type:"value",field:parsed.field,value,negated:!!parsed.negated,label:formatFilterValue(parsed.field,value)}));
   }
   const term=input.trim().toLowerCase();
   const rows=Object.entries(fields).filter(([field,label])=>field!=="text"&&(!term||label.toLowerCase().includes(term)||field.includes(term)))
@@ -260,16 +261,17 @@ function chooseSuggestion(index){
   const item=suggestions[index];
   if(!item)return;
   if(item.type==="field"){
-    $("search").value=fields[item.field]+": ";
+    const negated=editingFilter!==null&&state.filters[editingFilter].negated;
+    $("search").value=fields[item.field]+(negated?" != ":": ");
     state.search="";
     errorBox("filter-error","");
     renderTraffic();renderSuggestions();$("search").focus();
-  }else commitFilter(item.field,item.value);
+  }else commitFilter(item.field,item.value,item.negated);
 }
 
-function commitFilter(field,value){
+function commitFilter(field,value,negated=false){
   try{
-    addFilter(field,value,editingFilter);
+    addFilter(field,value,editingFilter,negated);
     editingFilter=null;state.search="";$("search").value="";
     errorBox("filter-error","");closeSuggestions();renderTraffic();$("search").focus();
   }catch(err){errorBox("filter-error",err.message);}
@@ -279,7 +281,7 @@ function commitFilterInput(){
   const input=$("search").value.trim();
   if(!input)return;
   const parsed=parseFilterInput(input);
-  if(parsed)commitFilter(parsed.field,parsed.value);
+  if(parsed)commitFilter(parsed.field,parsed.value,parsed.negated);
   else commitFilter("text",input);
 }
 
@@ -417,14 +419,20 @@ $("search").onkeydown=e=>{
 $("filter-suggestions").onpointerdown=e=>e.preventDefault();
 $("filter-suggestions").onclick=e=>{const option=e.target.closest("[data-suggestion]");if(option)chooseSuggestion(Number(option.dataset.suggestion));};
 $("filter-chips").onclick=e=>{
-  const remove=e.target.closest("[data-remove-filter]"),edit=e.target.closest("[data-edit-filter]");
-  if(remove){
+  const remove=e.target.closest("[data-remove-filter]"),edit=e.target.closest("[data-edit-filter]"),negate=e.target.closest("[data-negate-filter]");
+  if(negate){
+    const index=Number(negate.dataset.negateFilter);
+    state.filters[index].negated=!state.filters[index].negated;
+    if(editingFilter===index)cancelFilterInput();
+    state.page=0;renderTraffic();closeSuggestions();
+    $("filter-chips").querySelector('[data-negate-filter="'+index+'"]').focus();
+  }else if(remove){
     const index=Number(remove.dataset.removeFilter);state.filters.splice(index,1);
     if(editingFilter===index)cancelFilterInput();else if(editingFilter!==null&&editingFilter>index)editingFilter--;
     state.page=0;renderTraffic();$("search").focus();
   }else if(edit){
     editingFilter=Number(edit.dataset.editFilter);const filter=state.filters[editingFilter];
-    $("search").value=fields[filter.field]+": "+formatFilterValue(filter.field,filter.value);
+    $("search").value=fields[filter.field]+" "+formatFilterOperator(filter.field,filter.value,filter.negated)+" "+formatFilterValue(filter.field,filter.value);
     state.search="";errorBox("filter-error","");renderTraffic();$("search").focus();renderSuggestions();
   }
 };
