@@ -257,9 +257,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self.reply(400, {"error": "Invalid cursor"})
             return self.reply(200, app.state(since))
-        if path in {"/", "/index.html", "/app.js", "/styles.css"}:
+        if path in {"/", "/index.html", "/app.js", "/filters.mjs", "/styles.css"}:
             file = WEB / ("index.html" if path == "/" else path[1:])
-            mime = {".html": "text/html", ".js": "text/javascript", ".css": "text/css"}[file.suffix]
+            mime = {".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css"}[file.suffix]
             return self.reply(200, file.read_bytes(), mime + "; charset=utf-8")
         return self.reply(404, {"error": "Not found"})
 

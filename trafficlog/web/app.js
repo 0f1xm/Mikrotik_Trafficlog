@@ -1,13 +1,12 @@
-"use strict";
+import {actions,fields,ipNumber,compileFilter,normalizeFilterValue,formatFilterValue,parseFilterInput} from "./filters.mjs";
 
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const icon = name => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
-const actions = {accept:"Allowed", drop:"Blocked", reject:"Rejected"};
 const services = {20:"FTP",21:"FTP",22:"SSH",25:"SMTP",53:"DNS",67:"DHCP",68:"DHCP",80:"HTTP",123:"NTP",161:"SNMP",179:"BGP",443:"HTTPS",445:"SMB",3389:"RDP",8000:"HTTP",8291:"WinBox"};
-const fields = {source:"Source IP",destination:"Destination IP",destination_port:"Dst. port",source_port:"Source port",rule_name:"Rule",input:"Ingress",output:"Egress",chain:"Chain"};
-const state = {token:"",router:null,rules:[],knownRules:new Set(),selected:new Set(),events:[],sequence:0,session:null,view:"traffic",filters:[],search:"",action:"",protocol:"",sort:"received",descending:true,page:0,pageSize:100,paused:false,pausedEvents:null,detail:null,closed:false,lastRuleSignature:""};
+const state = {token:"",router:null,rules:[],knownRules:new Set(),selected:new Set(),events:[],sequence:0,session:null,view:"traffic",filters:[],search:"",sort:"received",descending:true,page:0,pageSize:100,paused:false,pausedEvents:null,detail:null,closed:false,lastRuleSignature:""};
 let toastTimer, pollBusy = false, previewVersion = 0, previewPlan = null;
+let suggestions=[], activeSuggestion=-1, editingFilter=null;
 
 function toast(message) {
   $("toast").textContent = message;
@@ -49,7 +48,8 @@ function consume(data) {
   if (key !== oldKey) {
     state.selected.clear(); state.knownRules.clear(); state.events = []; state.detail = null;
     $("detail-drawer").classList.add("hidden");
-    state.filters = []; state.page = 0; setPaused(false);
+    if(oldKey){state.filters=[];state.search="";$("search").value="";editingFilter=null;closeSuggestions();}
+    state.page=0;setPaused(false);
   }
   state.router = data.router; state.session = data.session;
   state.rules = data.rules || [];
@@ -118,46 +118,11 @@ function renderStatus() {
   $("pause-button").disabled = !state.events.length;
 }
 
-function ipNumber(ip) {
-  const parts = ip.split(".");
-  if (parts.length !== 4 || parts.some(p => !/^\d{1,3}$/.test(p) || Number(p)>255)) throw new Error("Enter a valid IPv4 address or CIDR network.");
-  return parts.reduce((n,p) => (n * 256 + Number(p)) >>> 0, 0);
-}
-
-function compileFilter(field, value) {
-  const values = value.split(",").map(s => s.trim()).filter(Boolean);
-  if (!values.length) throw new Error("Enter a filter value.");
-  if (field === "source" || field === "destination") {
-    const nets = values.map(v => {
-      const parts = v.split("/");
-      if (parts.length>2 || (parts.length===2 && !/^\d+$/.test(parts[1]))) throw new Error("Invalid IPv4 network.");
-      const bits = parts.length===2 ? Number(parts[1]) : 32;
-      if (bits<0 || bits>32) throw new Error("Prefix length must be between /0 and /32.");
-      const mask = bits===0 ? 0 : (0xffffffff << (32-bits)) >>> 0;
-      return {network:(ipNumber(parts[0]) & mask) >>> 0,mask};
-    });
-    return e => nets.some(n => { try {return ((ipNumber(e[field]) & n.mask) >>> 0) === n.network;} catch {return false;} });
-  }
-  if (field.endsWith("_port")) {
-    const ranges = values.map(v => {
-      if (!/^\d+(?:-\d+)?$/.test(v)) throw new Error("Enter a port, range or comma-separated list.");
-      const [a,b] = v.split("-").map(Number), end = b ?? a;
-      if (a<0 || end>65535 || end<a) throw new Error("Port range must be between 0 and 65535.");
-      return [a,end];
-    });
-    return e => e[field] != null && ranges.some(([a,b]) => Number(e[field])>=a && Number(e[field])<=b);
-  }
-  return e => values.some(v => String(e[field] || "").toLocaleLowerCase().includes(v.toLocaleLowerCase()));
-}
-
 function filteredEvents() {
-  const search = state.search.trim().toLowerCase();
-  const events = state.paused ? state.pausedEvents : state.events;
-  const predicates = state.filters.map(f => compileFilter(f.field, f.value));
-  const result = events.filter(e => (!state.action || e.action===state.action)
-    && (!state.protocol || e.protocol===state.protocol)
-    && predicates.every(test => test(e))
-    && (!search || [e.source,e.destination,e.source_port,e.destination_port,e.rule_name,e.protocol,e.input,e.output,e.chain,actions[e.action]].join(" ").toLowerCase().includes(search)));
+  const events=state.paused?state.pausedEvents:state.events;
+  const predicates=state.filters.map(f=>compileFilter(f.field,f.value));
+  if(state.search.trim())predicates.push(compileFilter("text",state.search));
+  const result=events.filter(e=>predicates.every(test=>test(e)));
   result.sort((a,b) => {
     let av=a[state.sort] ?? "",bv=b[state.sort] ?? "", comparison;
     if (["source","destination"].includes(state.sort)) {try {av=ipNumber(av);bv=ipNumber(bv);} catch {}}
@@ -186,7 +151,7 @@ function renderTraffic() {
   const rows = filteredEvents();
   state.page = Math.min(state.page, Math.max(0, Math.ceil(rows.length/state.pageSize)-1));
   const start = state.page*state.pageSize, page = rows.slice(start,start+state.pageSize);
-  $("traffic-body").innerHTML = page.map(e => `<tr data-event="${e.sequence}" class="${state.detail?.sequence===e.sequence ? "selected" : ""}" tabindex="0" aria-label="Event ${esc(e.source)} nach ${esc(e.destination)}">
+  $("traffic-body").innerHTML = page.map(e => `<tr data-event="${e.sequence}" class="${state.detail?.sequence===e.sequence ? "selected" : ""}" tabindex="0" aria-label="Event ${esc(e.source)} to ${esc(e.destination)}">
     <td class="time" title="Received: ${esc(e.received)}">${displayTime(e)}<span class="subline">${esc(new Date(e.received).toLocaleDateString("en-GB", {day:"2-digit",month:"2-digit"}))}</span></td>
     <td class="ip"><button class="cell-link" data-filter-field="source" data-value="${esc(e.source)}">${esc(e.source)}</button><span class="subline">${e.source_port ? ":"+e.source_port : "—"}</span></td>
     <td class="ip"><button class="cell-link" data-filter-field="destination" data-value="${esc(e.destination)}">${esc(e.destination)}</button></td>
@@ -207,23 +172,23 @@ function renderTraffic() {
   $("previous-page").disabled = state.page===0;
   $("next-page").disabled = start+state.pageSize >= rows.length;
   $("filter-chips").classList.toggle("hidden", !state.filters.length);
-  $("filter-chips").innerHTML = state.filters.map((f,i) => `<span class="filter-chip">${esc(fields[f.field])}: <strong>${esc(f.value)}</strong><button data-remove-filter="${i}" aria-label="Remove filter">${icon("x")}</button></span>`).join("");
+  $("filter-chips").innerHTML=state.filters.map(renderFilterChip).join("");
   document.querySelectorAll("th[data-sort]").forEach(th => {
     th.classList.toggle("sorted", th.dataset.sort===state.sort);
     th.querySelector("span").textContent = th.dataset.sort===state.sort ? (state.descending ? "↓" : "↑") : "↕";
   });
 }
 
-function addFilter(field, value) {
-  compileFilter(field,value);
-  if (!state.filters.some(f => f.field===field && f.value===value)) state.filters.push({field,value});
-  state.page=0; renderTraffic();
+function addFilter(field,value,index=null) {
+  value=normalizeFilterValue(field,value);compileFilter(field,value);
+  const filter={field,value};
+  if(index!==null)state.filters.splice(index,1);
+  if(!state.filters.some(f=>f.field===field&&f.value===value))state.filters.push(filter);
+  state.page=0;renderTraffic();
 }
 
 function resetFilters() {
-  state.filters=[]; state.search=""; state.action=""; state.protocol=""; state.page=0;
-  $("search").value=""; $("action-filter").value=""; $("protocol-filter").value="";
-  renderTraffic();
+  state.filters=[];state.page=0;cancelFilterInput();
 }
 
 function renderRules() {
@@ -255,15 +220,85 @@ function openDetails(event) {
   $("detail-drawer").classList.remove("hidden");
 }
 
-function updateFilterEditor() {
-  const field=$("filter-field").value;
-  const ips = ["source","destination"].includes(field), ports=field.endsWith("_port");
-  $("filter-value").placeholder = ips ? "10.0.1.24 or 10.0.1.0/24" : ports ? "443 or 80,443 or 8000-8100" : "Enter or select a value";
-  $("filter-help").textContent = ips ? "IPv4/CIDR · comma-separated" : ports ? "80,443 · 8000-8100" : "";
-  const values = [...new Set(state.events.map(e=>e[field]).filter(v=>v!==null && v!==undefined && v!==""))].slice(0,150);
-  $("filter-values").innerHTML = values.map(v=>`<option value="${esc(v)}"></option>`).join("");
+function renderFilterChip(filter,index){
+  return '<span class="filter-chip'+(editingFilter===index?' editing':'')+'"><button type="button" data-edit-filter="'+index+'">'+esc(fields[filter.field])+': <strong>'+esc(formatFilterValue(filter.field,filter.value))+'</strong></button><button type="button" data-remove-filter="'+index+'" aria-label="Remove '+esc(fields[filter.field])+' filter">'+icon("x")+'</button></span>';
 }
 
+function closeSuggestions(){
+  $("filter-suggestions").classList.add("hidden");
+  $("search").setAttribute("aria-expanded","false");
+  $("search").removeAttribute("aria-activedescendant");
+  activeSuggestion=-1;
+}
+
+function filterSuggestions(){
+  const input=$("search").value,parsed=parseFilterInput(input);
+  if(parsed){
+    let values=parsed.field==="action"?Object.keys(actions):parsed.field==="protocol"?["TCP","UDP","ICMP","ICMPV6"]:[];
+    values=[...new Set([...values,...state.events.map(e=>e[parsed.field]).filter(v=>v!==null&&v!==undefined&&v!=="").map(String)])];
+    const term=parsed.value.toLowerCase();
+    return values.filter(v=>v.toLowerCase().includes(term)||formatFilterValue(parsed.field,v).toLowerCase().includes(term))
+      .slice(0,12).map(value=>({type:"value",field:parsed.field,value,label:formatFilterValue(parsed.field,value)}));
+  }
+  const term=input.trim().toLowerCase();
+  const rows=Object.entries(fields).filter(([field,label])=>field!=="text"&&(!term||label.toLowerCase().includes(term)||field.includes(term)))
+    .map(([field,label])=>({type:"field",field,label}));
+  if(term)rows.push({type:"search",field:"text",value:input.trim(),label:'Search: '+input.trim()});
+  return rows;
+}
+
+function renderSuggestions(){
+  suggestions=filterSuggestions();
+  activeSuggestion=-1;
+  $("filter-suggestions").innerHTML=suggestions.map((item,index)=>'<button type="button" role="option" aria-selected="false" id="filter-option-'+index+'" data-suggestion="'+index+'">'+esc(item.label)+'</button>').join("");
+  $("filter-suggestions").classList.toggle("hidden",!suggestions.length);
+  $("search").setAttribute("aria-expanded",String(!!suggestions.length));
+  $("search").removeAttribute("aria-activedescendant");
+}
+
+function chooseSuggestion(index){
+  const item=suggestions[index];
+  if(!item)return;
+  if(item.type==="field"){
+    $("search").value=fields[item.field]+": ";
+    state.search="";
+    errorBox("filter-error","");
+    renderTraffic();renderSuggestions();$("search").focus();
+  }else commitFilter(item.field,item.value);
+}
+
+function commitFilter(field,value){
+  try{
+    addFilter(field,value,editingFilter);
+    editingFilter=null;state.search="";$("search").value="";
+    errorBox("filter-error","");closeSuggestions();renderTraffic();$("search").focus();
+  }catch(err){errorBox("filter-error",err.message);}
+}
+
+function commitFilterInput(){
+  const input=$("search").value.trim();
+  if(!input)return;
+  const parsed=parseFilterInput(input);
+  if(parsed)commitFilter(parsed.field,parsed.value);
+  else commitFilter("text",input);
+}
+
+function cancelFilterInput(){
+  editingFilter=null;state.search="";$("search").value="";
+  errorBox("filter-error","");closeSuggestions();renderTraffic();
+}
+
+function moveSuggestion(direction){
+  if($("filter-suggestions").classList.contains("hidden"))renderSuggestions();
+  if(!suggestions.length)return;
+  activeSuggestion=activeSuggestion<0?(direction>0?0:suggestions.length-1):(activeSuggestion+direction+suggestions.length)%suggestions.length;
+  $("filter-suggestions").querySelectorAll("[role=option]").forEach((option,index)=>{
+    option.setAttribute("aria-selected",String(index===activeSuggestion));
+  });
+  const option=$("filter-option-"+activeSuggestion);
+  $("search").setAttribute("aria-activedescendant",option.id);
+  option.scrollIntoView({block:"nearest"});
+}
 function exportCSV() {
   const rows=filteredEvents();
   if (!rows.length) return toast("No matching events to export.");
@@ -363,14 +398,38 @@ $("capture-form").onsubmit=async e=>{
 for(const id of ["capture-mode","capture-minutes","capture-source"])$(id).onchange=refreshPreview;
 $("edit-selection").onclick=()=>{closeDialog("capture-dialog");showView("rules");};
 $("empty-connect").onclick=()=>state.events.length ? resetFilters() : state.router ? openCapture() : openConnection();
-$("search").oninput=e=>{state.search=e.target.value;state.page=0;renderTraffic();};
-$("action-filter").onchange=e=>{state.action=e.target.value;state.page=0;renderTraffic();};
-$("protocol-filter").onchange=e=>{state.protocol=e.target.value;state.page=0;renderTraffic();};
-$("reset-filters").onclick=resetFilters;
-$("add-filter").onclick=()=>{errorBox("filter-error","");$("filter-value").value="";updateFilterEditor();openDialog("filter-dialog");};
-$("filter-field").onchange=updateFilterEditor;
-$("filter-form").onsubmit=e=>{e.preventDefault();try{addFilter($("filter-field").value,$("filter-value").value.trim());closeDialog("filter-dialog");}catch(err){errorBox("filter-error",err.message);}};
-$("filter-chips").onclick=e=>{const b=e.target.closest("[data-remove-filter]");if(b){state.filters.splice(Number(b.dataset.removeFilter),1);state.page=0;renderTraffic();}};
+$("filter-form").onsubmit=e=>{e.preventDefault();commitFilterInput();};
+$("search").onfocus=renderSuggestions;
+$("search").onclick=renderSuggestions;
+$("search").oninput=()=>{
+  errorBox("filter-error","");
+  state.search=parseFilterInput($("search").value)?"":$("search").value;
+  state.page=0;renderTraffic();renderSuggestions();
+};
+$("search").onkeydown=e=>{
+  if(e.key==="ArrowDown"||e.key==="ArrowUp"){e.preventDefault();moveSuggestion(e.key==="ArrowDown"?1:-1);}
+  else if(e.key==="Enter"){e.preventDefault();if(activeSuggestion>=0)chooseSuggestion(activeSuggestion);else commitFilterInput();}
+  else if(e.key==="Escape"){e.preventDefault();e.stopPropagation();cancelFilterInput();}
+  else if(e.key==="Backspace"&&!$("search").value&&editingFilter===null&&state.filters.length){
+    state.filters.pop();state.page=0;renderTraffic();
+  }
+};
+$("filter-suggestions").onpointerdown=e=>e.preventDefault();
+$("filter-suggestions").onclick=e=>{const option=e.target.closest("[data-suggestion]");if(option)chooseSuggestion(Number(option.dataset.suggestion));};
+$("filter-chips").onclick=e=>{
+  const remove=e.target.closest("[data-remove-filter]"),edit=e.target.closest("[data-edit-filter]");
+  if(remove){
+    const index=Number(remove.dataset.removeFilter);state.filters.splice(index,1);
+    if(editingFilter===index)cancelFilterInput();else if(editingFilter!==null&&editingFilter>index)editingFilter--;
+    state.page=0;renderTraffic();$("search").focus();
+  }else if(edit){
+    editingFilter=Number(edit.dataset.editFilter);const filter=state.filters[editingFilter];
+    $("search").value=fields[filter.field]+": "+formatFilterValue(filter.field,filter.value);
+    state.search="";errorBox("filter-error","");renderTraffic();$("search").focus();renderSuggestions();
+  }
+};
+$("filter-bar").onclick=e=>{if(e.target===$("filter-bar")||e.target===$("filter-chips"))$("search").focus();};
+document.addEventListener("pointerdown",e=>{if(!$("filter-form").contains(e.target))closeSuggestions();});
 $("pause-button").onclick=()=>{
   setPaused(!state.paused);renderTraffic();
 };
